@@ -3,7 +3,7 @@ title: "Lab 5: Optimal Dike Height"
 subtitle: "CEVE 421/521"
 date: 2026-02-20
 engine: julia
-status: draft
+status: published
 
 format:
   html:
@@ -32,6 +32,7 @@ execute:
 code-overflow: wrap
 code-line-numbers: false
 code-block-font-size: "0.85em"
+code-annotations: below
 ---
 
 ## Overview
@@ -45,8 +46,8 @@ We'll use optimization to find the height that minimizes total cost, then see ho
 
 **References:**
 
-- [ICOW.jl documentation](https://dossgollin-lab.github.io/ICOW.jl/)
-- [SimOptDecisions documentation](https://dossgollin-lab.github.io/SimOptDecisions/)
+- [ICOW.jl documentation](https://dossgollin-lab.github.io/ICOW.jl/) — the flood risk model
+- [SimOptDecisions documentation](https://dossgollin-lab.github.io/SimOptDecisions/) — the optimization framework
 
 ## Before Lab
 
@@ -67,6 +68,13 @@ We'll use optimization to find the height that minimizes total cost, then see ho
 ::: {.callout-important}
 **Submission:** You will render this notebook to PDF and submit the PDF to Canvas.
 See @sec-submission for details.
+:::
+
+::: {.callout-warning}
+**This lab is computationally heavy.**
+The optimization cells can take a minute or more to run.
+Rather than using Quarto preview (which re-renders every time you save), we recommend running cells one at a time in VS Code using `Shift+Enter`.
+Save `quarto render` for the end when you're ready to produce your PDF.
 :::
 
 ## Setup
@@ -114,64 +122,138 @@ Random.seed!(2026)
 
 ### Storm Surge Parameters
 
-Same GEV surge distribution as Lab 4: location $\mu$ sets the typical annual max, scale $\sigma$ controls the spread, and shape $\xi > 0$ gives a heavy tail (rare but very large surges are possible).
+We model the annual maximum storm surge using a Generalized Extreme Value (GEV) distribution, the same one from Lab 4.
+The GEV CDF is
+
+$$
+F(x) = \exp\left\{-\left[1 + \xi\left(\frac{x - \mu}{\sigma}\right)\right]^{-1/\xi}\right\}
+$$
+
+where the three parameters control different aspects of the distribution:
 
 ```{julia}
 #| output: false
-μ = 3.0   # GEV location (m) — typical annual max surge
-σ = 1.0   # GEV scale (m) — spread of annual maxima
-ξ = 0.15  # GEV shape — positive means heavy-tailed
+μ = 3.0   # GEV location (m) — typical annual max surge # <1>
+σ = 1.0   # GEV scale (m) — spread of annual maxima # <2>
+ξ = 0.15  # GEV shape — positive means heavy-tailed # <3>
 ```
+1. $\mu$ (location): centers the distribution — sets the typical annual maximum surge
+2. $\sigma$ (scale): controls the spread — larger means more year-to-year variability
+3. $\xi$ (shape): controls the tail — positive means rare surges can be *much* larger than the typical one (a "heavy tail")
 
 ## Set Up the Optimization
 
 In lecture you saw the XLRM framework: e**X**ogenous uncertainties, **L**evers, **R**elationships (the model), and **M**etrics.
-This lab puts all four pieces together computationally — ICOW is the model (R), the surge and SLR scenarios are the uncertainties (X), dike height is the lever (L), and total cost is the metric (M).
+This lab puts all four pieces together computationally using two packages:
 
-### The Decision: How Tall Should the Dike Be?
+- [**ICOW**](https://dossgollin-lab.github.io/ICOW.jl/) is the **R**elationship model — it computes flood damage given a dike height, surge hazard, and sea-level rise trajectory
+- [**SimOptDecisions**](https://dossgollin-lab.github.io/SimOptDecisions/) is the optimization framework — it searches over **L**evers to minimize a **M**etric, given the e**X**ogenous uncertainties
 
-ICOW's `StaticPolicy` has five defense levers (withdrawal, dike height, dike base, resistance, and flood-proofing).
-We'll fix four and optimize only `a_frac` — the fraction of city elevation allocated to dike height.
-With our defaults, $D = 0.8 \times \texttt{a\_frac} \times 17\text{m}$, so `a_frac = 0.3` gives roughly a 4m dike.
+### The Decision: Dike Height
+
+ICOW's built-in `StaticPolicy` has five defense levers (withdrawal, dike height, dike base, resistance, flood-proofing), but we only want to vary one.
+Rather than using all five and trying to hold four constant, we define our own policy type with a single decision variable.
+
+[`@policydef`](https://dossgollin-lab.github.io/SimOptDecisions/concepts.html) from SimOptDecisions lets us create custom policy types.
+Each `@continuous` field becomes a parameter the optimizer can search over:
 
 ```{julia}
 #| output: false
-# Fixed defense parameters (no withdrawal, resistance, or flood-proofing)
-const W_FRAC = 0.0   # no withdrawal
-const B_FRAC = 0.2   # reasonable dike base
-const R_FRAC = 0.0   # no resistance height
-const P_FRAC = 0.0   # no flood-proofing
+SimOptDecisions.@policydef DikeOnlyPolicy begin
+    @continuous a_frac 0.0 0.8 # <1>
+end
+```
+1. Declares `a_frac` as a continuous decision variable that the optimizer can vary between 0.0 and 0.8
+
+The variable `a_frac` represents the fraction of city elevation allocated to dike height.
+With ICOW's default city geometry, the physical dike height is
+
+$$
+D = 0.8 \times \texttt{a\_frac} \times 17\text{ m}
+$$
+
+so `a_frac = 0.3` gives roughly a 4 m dike, and `a_frac = 0.8` gives the maximum ~11 m dike.
+
+### Connecting Our Policy to ICOW
+
+ICOW's simulation expects a full `StaticPolicy`, so we need a bridge function that converts our simple one-parameter policy into a full one (with the other levers set to their defaults):
+
+```{julia}
+#| output: false
+function to_static(policy::DikeOnlyPolicy)
+    return StaticPolicy(;
+        a_frac=SimOptDecisions.value(policy.a_frac),
+        w_frac=0.0,   # no withdrawal
+        b_frac=0.2,   # reasonable dike base
+        r_frac=0.0,   # no resistance
+        P=0.0,        # no flood-proofing
+    )
+end
+```
+
+Next, we teach SimOptDecisions how to simulate our custom policy type.
+This uses Julia's *multiple dispatch*: we add a new method to `SimOptDecisions.simulate` that accepts our `DikeOnlyPolicy`, converts it, and forwards to ICOW.
+
+```{julia}
+#| output: false
+function SimOptDecisions.simulate(
+    config::EADConfig, scenario::EADScenario, policy::DikeOnlyPolicy, rng::AbstractRNG
+)
+    return SimOptDecisions.simulate(config, scenario, to_static(policy), rng)
+end
 ```
 
 ### Scenario: Surge + Sea-Level Rise
 
-An `EADScenario` bundles everything the decision-maker can't control: the surge hazard (GEV parameters), a sea-level rise trajectory (from BRICK), and a discount rate.
+An [`EADScenario`](https://dossgollin-lab.github.io/ICOW.jl/) bundles everything the decision-maker can't control: the surge hazard (GEV parameters), a sea-level rise trajectory, and a discount rate.
 ICOW uses these to compute expected annual damage at each year, then discounts future costs back to present value.
 
-Let's start with the RCP 8.5 median over a 50-year planning horizon.
+First, load the sea-level rise projections from the BRICK model:
 
 ```{julia}
 #| output: false
 brick_data = load_brick_projections()
 rcp85 = get_brick_scenario(brick_data, "rcp85")
 rcp85_quantiles = brick_quantiles(rcp85, [0.5])
-
 n_years = 50
 slr_rcp85_median = rcp85_quantiles[1:n_years, 1]
+```
 
-config = EADConfig(; n_years=n_years)
+Now build the scenario.
+The discount rate $r$ determines how much we value future damages relative to present costs — a dollar of damage $t$ years from now has a present value of $\frac{1}{(1+r)^t}$.
+At $r = 0.03$, damage 50 years out is worth only about \$0.22 today.
+
+```{julia}
+#| output: false
+config = EADConfig(; n_years=n_years) # <1>
 scenario_rcp85 = EADScenario(;
-    surge_loc=μ,
+    surge_loc=μ,                       # <2>
     surge_scale=σ,
     surge_shape=ξ,
-    mean_sea_level=slr_rcp85_median,
-    discount_rate=0.03,
+    mean_sea_level=slr_rcp85_median,   # <3>
+    discount_rate=0.03,                # <4>
 )
 ```
+1. 50-year planning horizon with default city geometry
+2. GEV parameters for the storm surge distribution (same as Lab 4)
+3. SLR trajectory — one value per year from the BRICK median projection
+4. 3% annual discount rate for computing net present value
 
 ### Objective: Minimize Total Cost
 
-Total cost = investment (building the dike) + expected damage (flood losses), both discounted to net present value.
+The total cost has two competing components:
+
+$$
+\text{Total Cost}(h) = \text{Investment}(h) + \text{NPV}\bigl[\text{Expected Damage}(h)\bigr]
+$$
+
+where the net present value of expected damage over the planning horizon is
+
+$$
+\text{NPV} = \sum_{t=1}^{T} \frac{E[\text{Damage}_t(h)]}{(1+r)^t}
+$$
+
+Investment increases with dike height $h$, while expected damage decreases.
 This is the benefit-cost framework from lecture: we want the dike height where the marginal cost of building higher equals the marginal reduction in expected damage.
 
 The `calculate_metrics` function receives one outcome per scenario, sums investment + damage for each, and averages across scenarios.
@@ -181,27 +263,35 @@ With a single scenario the average is trivial, but this matters when we optimize
 #| output: false
 function calculate_metrics(outcomes)
     total_costs = [
-        SimOptDecisions.value(o.investment) + SimOptDecisions.value(o.expected_damage)
+        SimOptDecisions.value(o.investment) + SimOptDecisions.value(o.expected_damage) # <1>
         for o in outcomes
     ]
-    return (; total_cost=mean(total_costs))
+    return (; total_cost=mean(total_costs)) # <2>
 end
 ```
+1. For each scenario outcome, sum the two cost components: upfront investment and discounted expected flood damage
+2. Average across all scenarios — with one scenario this is just the total cost; with an ensemble it becomes the expected cost
 
 ### Sanity Check
 
 Before letting an optimizer loose, it's good practice to evaluate a few policies by hand.
-`evaluate_policy` runs the ICOW model for a given policy and scenario — the same EAD calculation you saw in Lab 4, but now repeated for different dike heights.
+[`evaluate_policy`](https://dossgollin-lab.github.io/SimOptDecisions/tutorial/06-policy-search.html) runs the ICOW model for a given policy and scenario — the same EAD calculation you saw in Lab 4, but now repeated for different dike heights.
 
 ```{julia}
 #| label: tbl-sanity-check
 #| tbl-cap: "Total cost for different dike heights under RCP 8.5 median SLR"
 let
     results = map([0.0, 0.1, 0.2, 0.3, 0.4, 0.5]) do a
-        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
-        fd = FloodDefenses(policy, config)
-        metrics = evaluate_policy(config, [scenario_rcp85], policy, calculate_metrics)
-        (a_frac=a, dike_height_m=round(fd.D; digits=1), total_cost_B=round(metrics.total_cost / 1e9; digits=2))
+        policy = DikeOnlyPolicy(; a_frac=a)
+        fd = FloodDefenses(to_static(policy), config)
+        metrics = evaluate_policy(
+            config, [scenario_rcp85], policy, calculate_metrics
+        )
+        (
+            a_frac=a,
+            dike_height_m=round(fd.D; digits=1),
+            total_cost_B=round(metrics.total_cost / 1e9; digits=2),
+        )
     end
     DataFrame(results)
 end
@@ -220,61 +310,62 @@ Why is neither `a_frac = 0` nor `a_frac = 0.5` optimal?*
 ### How `SimOptDecisions.optimize()` Works
 
 The sanity check showed a U-shaped cost curve — there's a minimum somewhere in the middle.
-Instead of testing every value by hand, we use `SimOptDecisions.optimize()` to search automatically.
+Instead of testing every value by hand, we use [`SimOptDecisions.optimize()`](https://dossgollin-lab.github.io/SimOptDecisions/tutorial/06-policy-search.html) to search automatically.
 Here's what it does on each iteration:
 
 1. Propose a candidate `a_frac` value
-2. Build a `StaticPolicy` from it (plus our fixed parameters)
+2. Build a `DikeOnlyPolicy` from it
 3. Run ICOW via `simulate()` for that policy against each scenario
 4. Pass the results to `calculate_metrics` (sum investment + damage, average across scenarios)
 5. Use the metric to decide where to search next
 
-This repeats for `max_iterations × population_size` evaluations.
-The result contains `pareto_params` (best parameters found) and `pareto_objectives` (corresponding cost).
-
 We use ECA (Evolutionary Centers Algorithm), a population-based metaheuristic that maintains multiple candidate solutions and iteratively improves them.
-We pass `bounds` for each `StaticPolicy` parameter; setting `lower == upper` fixes it, so only `a_frac` varies.
 
 ### Single-Scenario Optimization
 
 
+First, configure the optimization backend.
+A [`MetaheuristicsBackend`](https://dossgollin-lab.github.io/SimOptDecisions/tutorial/06-policy-search.html) wraps an algorithm from [Metaheuristics.jl](https://jmejia8.github.io/Metaheuristics.jl/).
+
 ```{julia}
 #| output: false
 backend = MetaheuristicsBackend(;
-    algorithm=:ECA,
-    max_iterations=50,
-    population_size=20,
-)
-
-bounds_dike_only = [
-    (0.0, 0.8),           # a_frac — free to optimize
-    (W_FRAC, W_FRAC),     # w_frac — fixed
-    (B_FRAC, B_FRAC),     # b_frac — fixed
-    (R_FRAC, R_FRAC),     # r_frac — fixed
-    (P_FRAC, P_FRAC),     # P — fixed
-]
-
-result_rcp85 = SimOptDecisions.optimize(
-    config,
-    [scenario_rcp85],
-    StaticPolicy,
-    calculate_metrics,
-    [minimize(:total_cost)];
-    backend=backend,
-    bounds=bounds_dike_only,
+    algorithm=:ECA,          # Evolutionary Centers Algorithm
+    max_iterations=50,       # how many rounds of improvement
+    population_size=20,      # candidates evaluated per round
 )
 ```
 
-### Inspect the Result
+Now run the optimization.
+The search bounds come from the `@policydef` definition (`a_frac ∈ [0, 0.8]`), so we don't need to specify them separately.
 
 ```{julia}
-optimal_a_rcp85 = result_rcp85.pareto_params[1][1]
-optimal_cost_rcp85 = result_rcp85.pareto_objectives[1][1]
-
-optimal_policy_rcp85 = StaticPolicy(;
-    a_frac=optimal_a_rcp85, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC,
+#| output: false
+result_rcp85 = SimOptDecisions.optimize(
+    config,                  # <1>
+    [scenario_rcp85],        # <2>
+    DikeOnlyPolicy,          # <3>
+    calculate_metrics,       # <4>
+    [minimize(:total_cost)]; # <5>
+    backend=backend,         # <6>
 )
-fd_rcp85 = FloodDefenses(optimal_policy_rcp85, config)
+```
+1. `EADConfig` — city geometry and planning horizon
+2. List of scenarios to evaluate against (just one here)
+3. Policy type the optimizer will search over
+4. Function that computes the objective from simulation outcomes
+5. Minimize the `total_cost` metric returned by `calculate_metrics`
+6. Which optimization algorithm and how hard to search
+
+### Inspect the Result
+
+The result contains `pareto_params` (best parameters found) and `pareto_objectives` (corresponding cost).
+
+```{julia}
+optimal_a_rcp85 = result_rcp85.pareto_params[1][1]       # best a_frac found
+optimal_cost_rcp85 = result_rcp85.pareto_objectives[1][1] # corresponding total cost
+
+fd_rcp85 = FloodDefenses(to_static(DikeOnlyPolicy(; a_frac=optimal_a_rcp85)), config)
 
 println("Optimal a_frac: $(round(optimal_a_rcp85; digits=3))")
 println("Optimal dike height: $(round(fd_rcp85.D; digits=2)) m")
@@ -283,7 +374,7 @@ println("Minimum total cost: \$$(round(optimal_cost_rcp85 / 1e9; digits=2))B")
 
 ### A Different Scenario
 
-That result assumed RCP 8.5.
+That result assumed RCP 8.5 (high emissions).
 Let's re-optimize under RCP 2.6 (aggressive emissions cuts) and see how much the answer changes.
 
 ```{julia}
@@ -299,15 +390,19 @@ scenario_rcp26 = EADScenario(;
     mean_sea_level=slr_rcp26_median,
     discount_rate=0.03,
 )
+```
 
+Same `optimize()` call, just with a different scenario:
+
+```{julia}
+#| output: false
 result_rcp26 = SimOptDecisions.optimize(
     config,
     [scenario_rcp26],
-    StaticPolicy,
+    DikeOnlyPolicy,
     calculate_metrics,
     [minimize(:total_cost)];
     backend=backend,
-    bounds=bounds_dike_only,
 )
 ```
 
@@ -320,8 +415,7 @@ let
     optimal_a_rcp26 = result_rcp26.pareto_params[1][1]
     optimal_cost_rcp26 = result_rcp26.pareto_objectives[1][1]
     fd_rcp26 = FloodDefenses(
-        StaticPolicy(; a_frac=optimal_a_rcp26, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC),
-        config,
+        to_static(DikeOnlyPolicy(; a_frac=optimal_a_rcp26)), config
     )
 
     DataFrame(
@@ -344,13 +438,11 @@ end
 let
     a_values = 0.0:0.01:0.6
     costs_rcp85 = map(a_values) do a
-        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
-        metrics = evaluate_policy(config, [scenario_rcp85], policy, calculate_metrics)
+        metrics = evaluate_policy(config, [scenario_rcp85], DikeOnlyPolicy(; a_frac=a), calculate_metrics)
         metrics.total_cost / 1e9
     end
     costs_rcp26 = map(a_values) do a
-        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
-        metrics = evaluate_policy(config, [scenario_rcp26], policy, calculate_metrics)
+        metrics = evaluate_policy(config, [scenario_rcp26], DikeOnlyPolicy(; a_frac=a), calculate_metrics)
         metrics.total_cost / 1e9
     end
 
@@ -365,7 +457,6 @@ let
     lines!(ax, collect(a_values), costs_rcp85; color=:red, linewidth=2, label="RCP 8.5 median")
     lines!(ax, collect(a_values), costs_rcp26; color=:blue, linewidth=2, label="RCP 2.6 median")
 
-    # Mark optima
     scatter!(
         ax,
         [optimal_a_rcp85],
@@ -408,13 +499,24 @@ The two median scenarios gave similar answers — but medians compress the full 
 BRICK actually gives us many plausible SLR trajectories, some much more extreme than the median.
 What if we optimize over an *ensemble* of them at once?
 
-Each column of `get_brick_scenario()` is one ensemble member's trajectory.
-We build a vector of `EADScenario` objects — one per member — and pass them all to `optimize()`.
-Since `calculate_metrics` averages across outcomes, the optimizer finds the `a_frac` that minimizes *expected* total cost across the ensemble — implicitly treating each member as equally likely.
+Mathematically, we're solving
+
+$$
+\min_{h} \; \frac{1}{N} \sum_{i=1}^{N} \text{Total Cost}_i(h)
+$$
+
+where $i$ indexes ensemble members.
+Each member has the same surge distribution but a different SLR trajectory, so this finds the dike height that minimizes *expected* total cost across the ensemble — implicitly treating each member as equally likely.
+
+### Build the Ensemble
+
+Each column of `get_brick_scenario()` is one ensemble member's SLR trajectory.
+We build a vector of [`EADScenario`](https://dossgollin-lab.github.io/ICOW.jl/) objects — one per member.
+The surge parameters stay the same; what varies is the SLR path.
 
 ```{julia}
 #| output: false
-N_ensemble = 10
+N_ensemble = 3 # <1>
 rcp85_full = get_brick_scenario(brick_data, "rcp85")
 
 ensemble_scenarios = [
@@ -422,92 +524,111 @@ ensemble_scenarios = [
         surge_loc=μ,
         surge_scale=σ,
         surge_shape=ξ,
-        mean_sea_level=rcp85_full[1:n_years, i],
+        mean_sea_level=rcp85_full[1:n_years, i], # <2>
         discount_rate=0.03,
     )
     for i in 1:N_ensemble
 ]
+```
+1. Start small so the optimization runs quickly. Try increasing to 30 or 50 and see how the result changes!
+2. Column $i$ of the BRICK output gives ensemble member $i$'s sea-level rise trajectory
 
-# Use fewer iterations — each evaluation is N_ensemble× more expensive
+::: {.callout-tip}
+**Try it:** After you've run the ensemble optimization once with `N_ensemble = 3`, come back and increase it (e.g., to 10, 30, or 50) to see how the optimal dike height shifts as you include more SLR futures.
+More members means a better sample of the uncertainty — but each optimization evaluation takes proportionally longer.
+How would you decide when `N_ensemble` is "large enough"?
+(Hint: what should happen to the optimal dike height as you keep adding members?)
+:::
+
+### Optimize
+
+Same [`optimize()`](https://dossgollin-lab.github.io/SimOptDecisions/tutorial/06-policy-search.html) call as before, but now we pass all `N_ensemble` scenarios.
+Each function evaluation runs ICOW `N_ensemble` times (once per scenario), so each iteration is more expensive.
+We compensate by using a smaller population — with only one decision variable, a large population wastes effort exploring a 1D space.
+More iterations are cheap relative to more candidates per iteration, and they give the optimizer time to converge.
+
+```{julia}
+#| output: false
 ensemble_backend = MetaheuristicsBackend(;
     algorithm=:ECA,
-    max_iterations=30,
-    population_size=15,
-)
-
-result_ensemble = SimOptDecisions.optimize(
-    config,
-    ensemble_scenarios,
-    StaticPolicy,
-    calculate_metrics,
-    [minimize(:total_cost)];
-    backend=ensemble_backend,
-    bounds=bounds_dike_only,
+    max_iterations=100,  # <1>
+    population_size=5,   # <2>
 )
 ```
+1. Many iterations to ensure convergence — each iteration is cheap (only `population_size` evaluations)
+2. Small population because we only have one decision variable — no need to explore a high-dimensional space
+
+```{julia}
+#| output: false
+result_ensemble = SimOptDecisions.optimize(
+    config,
+    ensemble_scenarios,      # <1>
+    DikeOnlyPolicy,
+    calculate_metrics,       # <2>
+    [minimize(:total_cost)];
+    backend=ensemble_backend,
+)
+```
+1. All `N_ensemble` scenarios are passed — the optimizer evaluates every candidate dike height against all of them
+2. `calculate_metrics` averages total cost across all outcomes, so the optimizer minimizes the *mean* cost
+
+### Inspect the Result
 
 ```{julia}
 optimal_a_ensemble = result_ensemble.pareto_params[1][1]
 optimal_cost_ensemble = result_ensemble.pareto_objectives[1][1]
-fd_ensemble = FloodDefenses(
-    StaticPolicy(;
-        a_frac=optimal_a_ensemble, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC,
-    ),
-    config,
-)
+fd_ensemble = FloodDefenses(to_static(DikeOnlyPolicy(; a_frac=optimal_a_ensemble)), config)
 
 println("Ensemble-optimal a_frac: $(round(optimal_a_ensemble; digits=3))")
 println("Ensemble-optimal dike height: $(round(fd_ensemble.D; digits=2)) m")
 println("Minimum expected total cost: \$$(round(optimal_cost_ensemble / 1e9; digits=2))B")
 ```
 
-### Check Convergence
-
-Metaheuristic optimizers don't guarantee they've found the true minimum — they can get stuck or bounce around, especially when each evaluation is expensive (here, each one runs ICOW across all ensemble members).
-
-Since we only have one free parameter, we can check by sweeping `a_frac` over a grid and plotting the cost curve.
-If the optimizer's star lands at the bottom, it converged.
-(For higher-dimensional problems this brute-force check wouldn't be feasible, which is why convergence diagnostics matter.)
+### Compare All Results
 
 ```{julia}
-#| label: fig-ensemble-convergence
-#| fig-cap: "Ensemble cost curve with optimizer result. If the star isn't at the bottom, increase `max_iterations`."
+#| label: tbl-all-comparison
+#| tbl-cap: "Optimal dike height: single-scenario vs. ensemble optimization"
 let
-    a_values = 0.0:0.02:0.6
-    costs = map(a_values) do a
-        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
-        metrics = evaluate_policy(config, ensemble_scenarios, policy, calculate_metrics)
-        metrics.total_cost / 1e9
-    end
+    optimal_a_rcp26 = result_rcp26.pareto_params[1][1]
+    optimal_cost_rcp26 = result_rcp26.pareto_objectives[1][1]
+    fd_rcp26 = FloodDefenses(
+        to_static(DikeOnlyPolicy(; a_frac=optimal_a_rcp26)), config
+    )
 
-    fig = Figure(; size=(700, 400))
-    ax = Axis(
-        fig[1, 1];
-        xlabel="a_frac",
-        ylabel="Mean Total Cost (\$B)",
-        title="Ensemble Cost Curve — Convergence Check",
+    DataFrame(
+        Scenario=[
+            "RCP 8.5 (median only)",
+            "RCP 2.6 (median only)",
+            "RCP 8.5 ($(N_ensemble)-member ensemble)",
+        ],
+        Optimal_a_frac=[
+            round(optimal_a_rcp85; digits=3),
+            round(optimal_a_rcp26; digits=3),
+            round(optimal_a_ensemble; digits=3),
+        ],
+        Dike_Height_m=[
+            round(fd_rcp85.D; digits=2),
+            round(fd_rcp26.D; digits=2),
+            round(fd_ensemble.D; digits=2),
+        ],
+        Total_Cost_B=[
+            "\$$(round(optimal_cost_rcp85 / 1e9; digits=2))B",
+            "\$$(round(optimal_cost_rcp26 / 1e9; digits=2))B",
+            "\$$(round(optimal_cost_ensemble / 1e9; digits=2))B",
+        ],
     )
-    lines!(ax, collect(a_values), costs; color=:purple, linewidth=2)
-    scatter!(
-        ax,
-        [optimal_a_ensemble],
-        [optimal_cost_ensemble / 1e9];
-        color=:orange,
-        markersize=15,
-        marker=:star5,
-        label="optimizer result",
-    )
-    axislegend(ax; position=:rt)
-    fig
 end
 ```
 
-If the star is off to one side, try increasing `max_iterations` (e.g., to 50 or 100) and re-running.
-
 ::: {.callout-tip appearance="simple" icon=false title="Question 3"}
-*Compare the ensemble-optimal dike height to the RCP 8.5 and RCP 2.6 single-scenario optima above.
-Where does it fall, and why?
-What does the ensemble approach implicitly assume about the likelihood of different SLR trajectories?*
+*Look at @tbl-all-comparison.
+Compare the ensemble-optimal dike height to the RCP 8.5 and RCP 2.6 single-scenario optima.*
+
+1. *Where does the ensemble result fall relative to the two single-scenario optima, and why?*
+2. *The ensemble approach implicitly assumes each SLR trajectory in the ensemble is equally likely.
+   Is that a reasonable assumption?
+   What would change if some trajectories were weighted more heavily?*
 :::
 
 
@@ -520,7 +641,7 @@ What are the limitations of either approach, and why might we want something bey
 :::
 
 
-## Enrichment (Optional) {.unnumbered}
+## Extensions (Optional) {.unnumbered}
 
 If you finish early, try one of these:
 
@@ -560,7 +681,7 @@ Before submitting:
 - [ ] Single-scenario optimization completed for RCP 8.5 and RCP 2.6
 - [ ] Scenario comparison table (@tbl-scenario-comparison) and cost curves (@fig-cost-curves) generated
 - [ ] Question 2 answered (scenario similarity and what drives it)
-- [ ] Ensemble results reviewed (@sec-ensemble)
+- [ ] Ensemble results reviewed (@tbl-all-comparison)
 - [ ] Question 3 answered (ensemble vs. single-scenario comparison)
 - [ ] Question 4 answered (reflection)
 - [ ] Notebook renders to PDF without errors
