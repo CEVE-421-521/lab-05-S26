@@ -1,4 +1,4 @@
-# Lab 5: Probabilistic Risk Analysis
+# Lab 5: Optimal Dike Height
 
 Lab 5 for CEVE 421/521 at Rice University by James Doss-Gollin.
 
